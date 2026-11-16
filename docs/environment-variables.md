@@ -71,6 +71,7 @@ those.
 - `GRAPH_MAPPING_HANDLER_TIMEOUT`: amount of time a mapping handler is allowed to
   take (in seconds, default is unlimited)
 - `GRAPH_ENTITY_CACHE_SIZE`: Size of the entity cache, in kilobytes. Defaults to 10000 which is 10MB.
+- `GRAPH_ENTITY_CACHE_EXCLUDE`: comma-separated entity type names, case-sensitive and exactly as written in the subgraph schema, whose entities are not kept in the entity cache between blocks, so each block reads them from the store again; applies to every deployment and ignores names that match no type. Unset or empty means no exclusion.
 - `GRAPH_MAX_API_VERSION`: Maximum `apiVersion` supported, if a developer tries to create a subgraph
   with a higher `apiVersion` than this in their mappings, they'll receive an error. Defaults to `0.0.7`.
 - `GRAPH_MAX_SPEC_VERSION`: Maximum `specVersion` supported. if a developer tries to create a subgraph
