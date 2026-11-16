@@ -1,3 +1,4 @@
+use diesel_async::SimpleAsyncConnection;
 use graph::blockchain::block_stream::{EntitySourceOperation, FirehoseCursor};
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data::value::Word;
@@ -314,6 +315,56 @@ fn get_derived_batch() {
 #[test]
 fn get_derived_nobatch() {
     get_with_pending(false, count_get_derived);
+}
+
+#[test]
+fn get_retired_version_with_pending_writes() {
+    run_test(|store, writable, _, deployment| async move {
+        let subgraph_store = store.subgraph_store();
+        let set_counter = |block: u8, id: &'static str| {
+            let subgraph_store = subgraph_store.cheap_clone();
+            let deployment = deployment.clone();
+            async move {
+                let data = entity! { TEST_SUBGRAPH_SCHEMA => id: id, count: 1, vid: block as i64 };
+                let op = EntityOperation::Set {
+                    key: count_key(id),
+                    data,
+                };
+                transact_entity_operations(
+                    &subgraph_store,
+                    &deployment,
+                    block_pointer(block),
+                    vec![op],
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let retired = count_key("retired");
+
+        set_counter(1, "retired").await;
+        writable.flush().await.unwrap();
+        let mut conn = PRIMARY_POOL.get().await.unwrap();
+        conn.batch_execute(&format!(
+            "do $$ begin execute format(
+                'update %I.counter set block_range = int4range(lower(block_range), lower(block_range) + 1) where id = %L',
+                (select name from deployment_schemas where id = {}), 'retired');
+            end $$",
+            deployment.id
+        ))
+        .await
+        .unwrap();
+
+        pause_writer(&deployment).await;
+        set_counter(2, "2").await;
+        assert!(writable.get(&retired).await.unwrap().is_some());
+
+        pause_writer(&deployment).await;
+        set_counter(3, "3").await;
+        assert_eq!(writable.get(&retired).await.unwrap(), None);
+
+        writable.flush().await.unwrap();
+    })
 }
 
 #[test]

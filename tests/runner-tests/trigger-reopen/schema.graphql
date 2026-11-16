@@ -1,0 +1,5 @@
+type PositionUpdateTrigger @entity(immutable: false) {
+  id: ID!
+  user: String!
+  updateTrigger: String!
+}
