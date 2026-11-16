@@ -267,6 +267,15 @@ importers:
         specifier: 0.31.0
         version: 0.31.0
 
+  tests/runner-tests/trigger-reopen:
+    devDependencies:
+      '@graphprotocol/graph-cli':
+        specifier: 0.98.1
+        version: 0.98.1(@types/node@24.3.0)(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10)(zod@3.25.76)
+      '@graphprotocol/graph-ts':
+        specifier: 0.35.0
+        version: 0.35.0
+
   tests/runner-tests/typename:
     devDependencies:
       '@graphprotocol/graph-cli':

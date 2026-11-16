@@ -127,6 +127,9 @@ jobs:
       - name: Run runner tests
         run: just test-runner
 
+      - name: Run trigger reopen tests
+        run: just test-trigger-reopen
+
   rustfmt:
     name: Check rustfmt style
     runs-on: ubuntu-latest

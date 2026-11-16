@@ -50,6 +50,10 @@ test-unit *EXTRA_FLAGS:
 test-runner *EXTRA_FLAGS:
     @just _cargo-test {{EXTRA_FLAGS}} --package graph-tests --test runner_tests -- --nocapture
 
+# Run the trigger reopen runner tests
+test-trigger-reopen *EXTRA_FLAGS:
+    @just _cargo-test {{EXTRA_FLAGS}} --package graph-tests --test trigger_reopen -- --nocapture
+
 # Run integration tests
 test-integration *EXTRA_FLAGS:
     #!/usr/bin/env bash
