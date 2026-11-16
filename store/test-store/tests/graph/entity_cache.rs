@@ -1098,6 +1098,54 @@ fn entity_cache_exclude_drops_listed_types() {
 }
 
 #[test]
+fn entity_cache_exclude_extend_counts_weight() {
+    run_store_test(|_cache, _store, _deployment, writable| async move {
+        let seq_gen = SeqGenerator::new(1);
+        let mut state = BlockState::new(writable.clone(), LfuCache::new(), seq_gen.cheap_clone());
+        state
+            .entity_cache
+            .set_entity_cache_exclude(wallet_exclude());
+
+        let mut other = BlockState::new(writable, LfuCache::new(), seq_gen);
+        other
+            .entity_cache
+            .set_entity_cache_exclude(wallet_exclude());
+        let wallet1 = WALLET_TYPE.parse_key("1").unwrap();
+        other
+            .entity_cache
+            .get(&wallet1, GetScope::Store)
+            .await
+            .unwrap()
+            .unwrap();
+        state.extend(other);
+
+        let account1 = ACCOUNT_TYPE.parse_key("1").unwrap();
+        state
+            .entity_cache
+            .get(&account1, GetScope::Store)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = state
+            .entity_cache
+            .as_modifications(1, &STOPWATCH)
+            .await
+            .unwrap();
+
+        assert_eq!(cached_keys(&result), entity_keys(&ACCOUNT_TYPE, &["1"]));
+        // Same formula as `CacheEntry::weight` in `graph/src/util/lfu_cache.rs`.
+        let held_weight: usize = result
+            .entity_lfu_cache
+            .iter()
+            .map(|(key, value)| key.indirect_weight() + value.indirect_weight())
+            .sum();
+        assert!(held_weight > 0);
+        assert_eq!(result.evict_stats.new_weight, held_weight);
+    });
+}
+
+#[test]
 fn entity_cache_exclude_empty_keeps_all() {
     run_store_test(|_cache, _store, _deployment, writable| async move {
         let result = run_cache_entry_paths(writable, Vec::new()).await;

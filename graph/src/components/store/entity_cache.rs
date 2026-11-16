@@ -154,7 +154,7 @@ pub struct EntityCache {
     pub seq_gen: SeqGenerator,
 
     /// Entity type names whose entries are dropped from `current` by
-    /// `as_modifications`.
+    /// `as_modifications` and from the merged cache by `extend`.
     entity_cache_exclude: Cow<'static, [String]>,
 
     /// Keys of excluded types that entered `current` during this block.
@@ -522,8 +522,12 @@ impl EntityCache {
         assert!(!other.in_handler);
         debug_assert_eq!(self.entity_cache_exclude, other.entity_cache_exclude);
 
-        self.current.extend(other.current);
-        self.excluded_keys.extend(other.excluded_keys);
+        // Excluded keys are dropped before the merge because `LfuCache::extend` does not count merged weight.
+        let mut other_current = other.current;
+        for key in &other.excluded_keys {
+            other_current.remove(key);
+        }
+        self.current.extend(other_current);
         for (key, op) in other.updates {
             self.entity_op(key, op);
         }
