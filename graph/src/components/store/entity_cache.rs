@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -152,6 +152,13 @@ pub struct EntityCache {
 
     /// Shared sequence generator for VIDs and entity IDs within a block.
     pub seq_gen: SeqGenerator,
+
+    /// Entity type names whose entries are dropped from `current` by
+    /// `as_modifications` and from the merged cache by `extend`.
+    entity_cache_exclude: Cow<'static, [String]>,
+
+    /// Keys of excluded types that entered `current` during this block.
+    excluded_keys: Vec<EntityKey>,
 }
 
 impl Debug for EntityCache {
@@ -179,6 +186,8 @@ impl EntityCache {
             schema: store.input_schema(),
             store,
             seq_gen,
+            entity_cache_exclude: Cow::Borrowed(&ENV_VARS.mappings.entity_cache_exclude),
+            excluded_keys: Vec::new(),
         }
     }
 
@@ -203,6 +212,20 @@ impl EntityCache {
             schema: store.input_schema(),
             store,
             seq_gen,
+            entity_cache_exclude: Cow::Borrowed(&ENV_VARS.mappings.entity_cache_exclude),
+            excluded_keys: Vec::new(),
+        }
+    }
+
+    /// Replace the excluded entity type names taken from
+    /// `GRAPH_ENTITY_CACHE_EXCLUDE`. Call it before the cache is used.
+    pub fn set_entity_cache_exclude(&mut self, entity_types: Vec<String>) {
+        self.entity_cache_exclude = Cow::Owned(entity_types);
+    }
+
+    fn track_excluded(&mut self, key: &EntityKey) {
+        if is_excluded(&self.entity_cache_exclude, key) {
+            self.excluded_keys.push(key.clone());
         }
     }
 
@@ -244,6 +267,7 @@ impl EntityCache {
                 if !self.current.contains_key(key) {
                     let entity = self.store.get(key).await?;
                     self.current.insert(key.clone(), entity.map(Arc::new));
+                    self.track_excluded(key);
                 }
                 // Unwrap: we just inserted the entity
                 self.current.get(key).unwrap().cheap_clone()
@@ -298,6 +322,7 @@ impl EntityCache {
             if !self.current.contains_key(key) {
                 self.current
                     .insert(key.clone(), Some(Arc::new(entity.clone())));
+                self.track_excluded(key);
             }
         }
 
@@ -495,8 +520,14 @@ impl EntityCache {
 
     pub(crate) fn extend(&mut self, other: EntityCache) {
         assert!(!other.in_handler);
+        debug_assert_eq!(self.entity_cache_exclude, other.entity_cache_exclude);
 
-        self.current.extend(other.current);
+        // Excluded keys are dropped before the merge because `LfuCache::extend` does not count merged weight.
+        let mut other_current = other.current;
+        for key in &other.excluded_keys {
+            other_current.remove(key);
+        }
+        self.current.extend(other_current);
         for (key, op) in other.updates {
             self.entity_op(key, op);
         }
@@ -513,6 +544,15 @@ impl EntityCache {
         stopwatch: &StopwatchMetrics,
     ) -> Result<ModificationsAndCache, StoreError> {
         assert!(!self.in_handler);
+
+        if !self.entity_cache_exclude.is_empty() {
+            let excluded_updates = self
+                .updates
+                .keys()
+                .filter(|key| is_excluded(&self.entity_cache_exclude, key))
+                .cloned();
+            self.excluded_keys.extend(excluded_updates);
+        }
 
         // The first step is to make sure all entities being set are in `self.current`.
         // For each subgraph, we need a map of entity type to missing entity ids.
@@ -604,6 +644,9 @@ impl EntityCache {
                 mods.push(modification)
             }
         }
+        for key in self.excluded_keys {
+            self.current.remove(&key);
+        }
         let evict_stats = self
             .current
             .evict_and_stats(ENV_VARS.mappings.entity_cache_size);
@@ -614,4 +657,10 @@ impl EntityCache {
             evict_stats,
         })
     }
+}
+
+fn is_excluded(entity_types: &[String], key: &EntityKey) -> bool {
+    entity_types
+        .iter()
+        .any(|entity_type| entity_type == key.entity_type.typename())
 }

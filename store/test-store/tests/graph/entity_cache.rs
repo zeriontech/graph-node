@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use graph::blockchain::BlockTime;
 use graph::blockchain::block_stream::FirehoseCursor;
+use graph::components::store::ModificationsAndCache;
 use graph::components::store::{
     DeploymentCursorTracker, DerivedEntityQuery, GetScope, LoadRelatedRequest, ReadStore,
     StoredDynamicDataSource, WritableStore,
@@ -10,6 +11,7 @@ use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError, SubgraphHea
 use graph::data_source::CausalityRegion;
 use graph::prelude::alloy::primitives::B256;
 use graph::schema::{EntityKey, EntityType, InputSchema};
+use graph::util::lfu_cache::LfuCache;
 use graph::{
     components::store::{DeploymentId, DeploymentLocator},
     prelude::{DeploymentHash, Entity, EntityCache, EntityModification, Value},
@@ -982,4 +984,218 @@ fn no_interface_mods() {
 
         cache.set(key, entity, None).await.unwrap_err();
     })
+}
+
+fn wallet_exclude() -> Vec<String> {
+    vec![WALLET.to_string()]
+}
+
+fn entity_keys(entity_type: &EntityType, ids: &[&str]) -> BTreeSet<EntityKey> {
+    ids.iter()
+        .map(|id| entity_type.parse_key(*id).unwrap())
+        .collect()
+}
+
+fn cached_keys(result: &ModificationsAndCache) -> BTreeSet<EntityKey> {
+    result
+        .entity_lfu_cache
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn account_entity_no_vid(id: &str, name: &str, age: i32) -> Entity {
+    entity! { LOAD_RELATED_SUBGRAPH => id: id, name: name, email: "x@email.com", age: age }
+}
+
+/// One block in which keys of both types enter the cache through a `get`
+/// miss and hit, a `set` of a new and an existing entity, a `remove`,
+/// `load_related` (wallets only) and `extend`.
+async fn run_cache_entry_paths(
+    writable: Arc<dyn WritableStore>,
+    exclude: Vec<String>,
+) -> ModificationsAndCache {
+    let seq_gen = SeqGenerator::new(1);
+    let mut state = BlockState::new(writable.clone(), LfuCache::new(), seq_gen.cheap_clone());
+    state.entity_cache.set_entity_cache_exclude(exclude.clone());
+    let cache = &mut state.entity_cache;
+    let account1 = ACCOUNT_TYPE.parse_id("1").unwrap();
+
+    for _ in 0..2 {
+        let wallet = WALLET_TYPE.parse_key("1").unwrap();
+        cache.get(&wallet, GetScope::Store).await.unwrap().unwrap();
+        let account = ACCOUNT_TYPE.parse_key("1").unwrap();
+        cache.get(&account, GetScope::Store).await.unwrap().unwrap();
+    }
+
+    let wallet5 = create_wallet_entity_no_vid("5", &account1, 10);
+    cache
+        .set(WALLET_TYPE.parse_key("5").unwrap(), wallet5, None)
+        .await
+        .unwrap();
+    let account4 = account_entity_no_vid("4", "Newcomer", 30);
+    cache
+        .set(ACCOUNT_TYPE.parse_key("4").unwrap(), account4, None)
+        .await
+        .unwrap();
+
+    let wallet2 = create_wallet_entity_no_vid("2", &account1, 93);
+    cache
+        .set(WALLET_TYPE.parse_key("2").unwrap(), wallet2, None)
+        .await
+        .unwrap();
+    let account2 = account_entity_no_vid("2", "Cindini", 43);
+    cache
+        .set(ACCOUNT_TYPE.parse_key("2").unwrap(), account2, None)
+        .await
+        .unwrap();
+
+    cache.remove(WALLET_TYPE.parse_key("3").unwrap());
+    cache.remove(ACCOUNT_TYPE.parse_key("3").unwrap());
+
+    let request = LoadRelatedRequest {
+        entity_type: ACCOUNT_TYPE.clone(),
+        entity_field: "wallets".into(),
+        entity_id: ACCOUNT_TYPE.parse_id("2").unwrap(),
+        causality_region: CausalityRegion::ONCHAIN,
+    };
+    let related = cache.load_related(&request).await.unwrap();
+    assert_eq!(related.len(), 1);
+
+    let mut other = BlockState::new(writable, LfuCache::new(), seq_gen);
+    other.entity_cache.set_entity_cache_exclude(exclude);
+    let wallet6 = WALLET_TYPE.parse_key("6").unwrap();
+    other
+        .entity_cache
+        .get(&wallet6, GetScope::Store)
+        .await
+        .unwrap();
+    let account5 = ACCOUNT_TYPE.parse_key("5").unwrap();
+    other
+        .entity_cache
+        .get(&account5, GetScope::Store)
+        .await
+        .unwrap();
+    state.extend(other);
+
+    state
+        .entity_cache
+        .as_modifications(1, &STOPWATCH)
+        .await
+        .unwrap()
+}
+
+#[test]
+fn entity_cache_exclude_drops_listed_types() {
+    run_store_test(|_cache, _store, _deployment, writable| async move {
+        let result = run_cache_entry_paths(writable, wallet_exclude()).await;
+
+        assert_eq!(
+            cached_keys(&result),
+            entity_keys(&ACCOUNT_TYPE, &["1", "2", "3", "4", "5"])
+        );
+    });
+}
+
+#[test]
+fn entity_cache_exclude_extend_counts_weight() {
+    run_store_test(|_cache, _store, _deployment, writable| async move {
+        let seq_gen = SeqGenerator::new(1);
+        let mut state = BlockState::new(writable.clone(), LfuCache::new(), seq_gen.cheap_clone());
+        state
+            .entity_cache
+            .set_entity_cache_exclude(wallet_exclude());
+
+        let mut other = BlockState::new(writable, LfuCache::new(), seq_gen);
+        other
+            .entity_cache
+            .set_entity_cache_exclude(wallet_exclude());
+        let wallet1 = WALLET_TYPE.parse_key("1").unwrap();
+        other
+            .entity_cache
+            .get(&wallet1, GetScope::Store)
+            .await
+            .unwrap()
+            .unwrap();
+        state.extend(other);
+
+        let account1 = ACCOUNT_TYPE.parse_key("1").unwrap();
+        state
+            .entity_cache
+            .get(&account1, GetScope::Store)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = state
+            .entity_cache
+            .as_modifications(1, &STOPWATCH)
+            .await
+            .unwrap();
+
+        assert_eq!(cached_keys(&result), entity_keys(&ACCOUNT_TYPE, &["1"]));
+        // Same formula as `CacheEntry::weight` in `graph/src/util/lfu_cache.rs`.
+        let held_weight: usize = result
+            .entity_lfu_cache
+            .iter()
+            .map(|(key, value)| key.indirect_weight() + value.indirect_weight())
+            .sum();
+        assert!(held_weight > 0);
+        assert_eq!(result.evict_stats.new_weight, held_weight);
+    });
+}
+
+#[test]
+fn entity_cache_exclude_empty_keeps_all() {
+    run_store_test(|_cache, _store, _deployment, writable| async move {
+        let result = run_cache_entry_paths(writable, Vec::new()).await;
+
+        let mut expected = entity_keys(&ACCOUNT_TYPE, &["1", "2", "3", "4", "5"]);
+        expected.extend(entity_keys(&WALLET_TYPE, &["1", "2", "3", "4", "5", "6"]));
+        assert_eq!(cached_keys(&result), expected);
+    });
+}
+
+#[test]
+fn entity_cache_exclude_same_modifications() {
+    run_store_test(|_cache, _store, _deployment, writable| async move {
+        let stock = run_cache_entry_paths(writable.clone(), Vec::new()).await;
+        let excluded = run_cache_entry_paths(writable, wallet_exclude()).await;
+
+        // Two inserts, two overwrites and two removes.
+        assert_eq!(stock.modifications.len(), 6);
+        assert_eq!(
+            sort_by_entity_key(excluded.modifications),
+            sort_by_entity_key(stock.modifications)
+        );
+    });
+}
+
+#[test]
+fn entity_cache_exclude_rereads_store_next_block() {
+    run_store_test(|mut cache, store, deployment, writable| async move {
+        cache.set_entity_cache_exclude(wallet_exclude());
+        let key = WALLET_TYPE.parse_key("1").unwrap();
+        let account1 = ACCOUNT_TYPE.parse_id("1").unwrap();
+
+        let block1 = cache.get(&key, GetScope::Store).await.unwrap();
+        let original = create_wallet_entity("1", &account1, 67, 1);
+        assert_eq!(block1.as_deref(), Some(&original));
+        let block1 = cache.as_modifications(0, &STOPWATCH).await.unwrap();
+
+        let changed = create_wallet_operation("1", &account1, 79, 11);
+        transact_entity_operations(&store, &deployment, TEST_BLOCK_1_PTR.clone(), vec![changed])
+            .await
+            .unwrap();
+
+        let mut next = EntityCache::with_current(
+            Arc::new(writable.clone()),
+            block1.entity_lfu_cache,
+            SeqGenerator::new(2),
+        );
+        next.set_entity_cache_exclude(wallet_exclude());
+        let block2 = next.get(&key, GetScope::Store).await.unwrap();
+        let expected = create_wallet_entity("1", &account1, 79, 11);
+        assert_eq!(block2.as_deref(), Some(&expected));
+    });
 }

@@ -17,6 +17,12 @@ pub struct EnvVarsMapping {
     /// Set by the environment variable `GRAPH_ENTITY_CACHE_SIZE` (expressed in
     /// kilobytes). The default value is 10 megabytes.
     pub entity_cache_size: usize,
+    /// Entity type names that are not kept in the entity LFU cache between
+    /// blocks.
+    ///
+    /// Set by the environment variable `GRAPH_ENTITY_CACHE_EXCLUDE` as a
+    /// comma-separated list. Empty by default.
+    pub entity_cache_exclude: Vec<String>,
     /// Set by the environment variable `GRAPH_MAX_API_VERSION`. The default
     /// value is `0.0.8`.
     pub max_api_version: Version,
@@ -146,6 +152,7 @@ impl TryFrom<InnerMappingHandlers> for EnvVarsMapping {
         let vars = Self {
             entity_cache_dead_weight: x.entity_cache_dead_weight.0,
             entity_cache_size: x.entity_cache_size_in_kb * 1000,
+            entity_cache_exclude: parse_entity_cache_exclude(x.entity_cache_exclude),
 
             max_api_version: x.max_api_version,
             timeout: x.mapping_handler_timeout_in_secs.map(Duration::from_secs),
@@ -175,6 +182,8 @@ pub struct InnerMappingHandlers {
     entity_cache_dead_weight: EnvVarBoolean,
     #[envconfig(from = "GRAPH_ENTITY_CACHE_SIZE", default = "10000")]
     entity_cache_size_in_kb: usize,
+    #[envconfig(from = "GRAPH_ENTITY_CACHE_EXCLUDE")]
+    entity_cache_exclude: Option<String>,
     #[envconfig(from = "GRAPH_MAX_API_VERSION", default = "0.0.9")]
     max_api_version: Version,
     #[envconfig(from = "GRAPH_MAPPING_HANDLER_TIMEOUT")]
@@ -211,6 +220,14 @@ pub struct InnerMappingHandlers {
     wasm_opt_level: WasmOptLevel,
 }
 
+fn parse_entity_cache_exclude(s: Option<String>) -> Vec<String> {
+    s.unwrap_or_default()
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
 fn validate_ipfs_cache_location(path: PathBuf) -> Result<PathBuf, anyhow::Error> {
     if path.starts_with("redis://") {
         // We validate this later when we set up the Redis client
@@ -242,4 +259,32 @@ fn validate_ipfs_cache_location(path: PathBuf) -> Result<PathBuf, anyhow::Error>
         ));
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn entity_cache_exclude_parsing() {
+        let cases: [(Option<&str>, &[&str]); 6] = [
+            (None, &[]),
+            (Some(""), &[]),
+            (Some("A"), &["A"]),
+            (Some(" A , B ,"), &["A", "B"]),
+            (Some(",,"), &[]),
+            (Some("A,A"), &["A", "A"]),
+        ];
+        for (value, expected) in cases {
+            let mut env = HashMap::new();
+            if let Some(value) = value {
+                env.insert("GRAPH_ENTITY_CACHE_EXCLUDE".to_string(), value.to_string());
+            }
+            let inner = InnerMappingHandlers::init_from_hashmap(&env).unwrap();
+            let mapping = EnvVarsMapping::try_from(inner).unwrap();
+            assert_eq!(mapping.entity_cache_exclude, expected, "value: {value:?}");
+        }
+    }
 }
