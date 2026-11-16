@@ -130,6 +130,9 @@ jobs:
       - name: Run trigger reopen tests
         run: just test-trigger-reopen
 
+      - name: Run writer restart tests
+        run: just test-writer-restart
+
   rustfmt:
     name: Check rustfmt style
     runs-on: ubuntu-latest

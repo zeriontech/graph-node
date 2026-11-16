@@ -416,14 +416,12 @@ where
     ) -> Result<RunnerState<C>, SubgraphRunnerError> {
         debug!(self.logger, "Starting or restarting subgraph"; "reason" => ?reason);
 
-        // If restarting due to store error, try to restart the store
-        if matches!(reason, RestartReason::StoreError) {
-            let store = self.inputs.store.cheap_clone();
-            if let Some(store) = store.restart().await? {
-                let last_good_block = store.block_ptr().map(|ptr| ptr.number).unwrap_or(0);
-                self.revert_state_to(last_good_block);
-                self.inputs = Arc::new(self.inputs.with_store(store));
-            }
+        // Any restart reason can follow a failed write, and `restart` keeps a healthy writer.
+        let store = self.inputs.store.cheap_clone();
+        if let Some(store) = store.restart().await? {
+            let last_good_block = store.block_ptr().map(|ptr| ptr.number).unwrap_or(0);
+            self.revert_state_to(last_good_block);
+            self.inputs = Arc::new(self.inputs.with_store(store));
         }
 
         let block_stream = self.start_block_stream().await?;
