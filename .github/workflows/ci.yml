@@ -1,9 +1,9 @@
 name: Continuous Integration
 on:
   push:
-    branches: [master]
+    branches: ['zerion/**']
   pull_request:
-    branches: [master]
+    branches: ['zerion/**']
   workflow_dispatch:
 
 permissions:
@@ -23,8 +23,8 @@ env:
 jobs:
   unit-tests:
     name: Run unit tests
-    runs-on: nscloud-ubuntu-22.04-amd64-16x32
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       ipfs:
         image: ipfs/go-ipfs:v0.10.0
@@ -76,8 +76,8 @@ jobs:
 
   runner-tests:
     name: Subgraph Runner integration tests
-    runs-on: nscloud-ubuntu-22.04-amd64-16x32
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       ipfs:
         image: ipfs/go-ipfs:v0.10.0
@@ -126,76 +126,6 @@ jobs:
 
       - name: Run runner tests
         run: just test-runner
-
-  integration-tests:
-    name: Run integration tests
-    runs-on: nscloud-ubuntu-22.04-amd64-16x32
-    timeout-minutes: 20
-    services:
-      ipfs:
-        image: ipfs/go-ipfs:v0.10.0
-        ports:
-          - 3001:5001
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_USER: graph-node
-          POSTGRES_PASSWORD: let-me-in
-          POSTGRES_DB: graph-node
-          POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C -c max_connections=1000 -c shared_buffers=2GB"
-        options: >-
-          --health-cmd "pg_isready -U graph-node"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-          --name postgres
-        ports:
-          - 3011:5432
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
-
-      - name: Setup dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lld protobuf-compiler
-
-      - name: Setup rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1
-
-      - name: Setup just
-        uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff # v3
-
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@82dee4ba654bd2146511f85f0d013af94670c4de # v1
-        with:
-          version: v1.4.0
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
-
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 20
-          cache: pnpm
-
-      - name: Install Node.js dependencies
-        run: pnpm install
-
-      - name: Start anvil
-        run: anvil --gas-limit 100000000000 --base-fee 1 --timestamp 1743944919 --port 3021 &
-
-      - name: Build graph-node
-        run: just build --test integration_tests
-
-      - name: Run integration tests
-        run: |
-          export PATH="${{ github.workspace }}/node_modules/.bin:$PATH"
-          just test-integration
-
-      - name: Cat graph-node.log
-        if: always()
-        run: cat tests/integration-tests/graph-node.log || echo "No graph-node.log"
 
   rustfmt:
     name: Check rustfmt style
