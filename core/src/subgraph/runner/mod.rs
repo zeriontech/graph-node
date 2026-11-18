@@ -458,6 +458,30 @@ where
         Ok(self)
     }
 
+    /// Only a started block stream registers the cancel guard that unassigning removes.
+    fn can_observe_unassign(&self) -> bool {
+        self.cancel_handle.is_some()
+    }
+
+    async fn back_off_before_restart(
+        &mut self,
+        err: Error,
+        reason: RestartReason,
+    ) -> Result<RunnerState<C>, SubgraphRunnerError> {
+        if self.is_canceled() {
+            return self.cancel();
+        }
+        self.metrics.subgraph.deployment_status.failed();
+        error!(self.logger, "Subgraph failed to restart, retrying: {:#}", err;
+            "attempt" => self.state.backoff.attempt,
+            "retry_delay_s" => self.state.backoff.delay().as_secs());
+        self.state.backoff.sleep_async().await;
+        if self.is_canceled() {
+            return self.cancel();
+        }
+        Ok(RunnerState::Restarting { reason })
+    }
+
     pub async fn run(self) -> Result<(), SubgraphRunnerError> {
         self.run_inner(false).await.map(|_| ())
     }
@@ -499,7 +523,12 @@ where
                             reason: StopReason::Canceled,
                         }
                     } else {
-                        self.restart(reason).await?
+                        match self.restart(reason).await {
+                            Err(SubgraphRunnerError::Unknown(e)) if self.can_observe_unassign() => {
+                                self.back_off_before_restart(e, reason).await?
+                            }
+                            res => res?,
+                        }
                     }
                 }
 
@@ -563,7 +592,7 @@ where
         if block.trigger_count() == 0
             && self.state.skip_ptr_updates_timer.elapsed() <= SKIP_PTR_UPDATES_THRESHOLD
             && !self.inputs.store.is_deployment_synced()
-            && !close_to_chain_head(&block_ptr, &self.inputs.chain.chain_head_ptr().await?, 1000)
+            && !self.is_close_to_chain_head(&block_ptr).await
             && !max_end_block_reached
         {
             // Skip this block and continue with the same stream
@@ -601,6 +630,18 @@ where
             Action::Stop => Ok(RunnerState::Stopped {
                 reason: StopReason::MaxEndBlockReached,
             }),
+        }
+    }
+
+    /// An unreadable chain head counts as close, so the block is processed rather than skipped.
+    async fn is_close_to_chain_head(&self, block_ptr: &BlockPtr) -> bool {
+        match self.inputs.chain.chain_head_ptr().await {
+            Ok(chain_head_ptr) => close_to_chain_head(block_ptr, &chain_head_ptr, 1000),
+            Err(e) => {
+                warn!(self.logger, "Failed to read the chain head, processing the block";
+                    "error" => format!("{:#}", e));
+                true
+            }
         }
     }
 
@@ -1295,11 +1336,19 @@ where
                 if self.state.should_try_unfail_non_deterministic {
                     // If the deployment head advanced, we can unfail
                     // the non-deterministic error (if there's any).
-                    let outcome = self
+                    let outcome = match self
                         .inputs
                         .store
                         .unfail_non_deterministic_error(&block_ptr)
-                        .await?;
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            warn!(self.logger, "Failed to unfail subgraph, trying again on the next block";
+                                "error" => format!("{:#}", e));
+                            UnfailOutcome::BehindErrorBlock
+                        }
+                    };
 
                     // Stop trying unless we're still behind the error block.
                     if outcome != UnfailOutcome::BehindErrorBlock {
@@ -1381,7 +1430,13 @@ where
                     let message = format!("{:#}", e).replace('\n', "\t");
                     let err = anyhow!("{}, code: {}", message, LogCode::SubgraphSyncingFailure);
 
-                    self.fail_subgraph(message, Some(block_ptr), true).await?;
+                    if let Err(e) = self.fail_subgraph(message, Some(block_ptr), true).await {
+                        error!(self.logger, "Failed to record deterministic error, retrying: {:#}", e;
+                            "attempt" => self.state.backoff.attempt,
+                            "retry_delay_s" => self.state.backoff.delay().as_secs());
+                        self.state.backoff.sleep_async().await;
+                        return Ok(Action::Restart);
+                    }
 
                     Err(err)
                 }
@@ -1408,8 +1463,19 @@ where
                     //
                     // If we don't do this check we would keep adding the same error to the
                     // database.
-                    if !self.inputs.store.health().await?.is_failed() {
-                        self.fail_subgraph(message, Some(block_ptr), false).await?;
+                    let already_failed = match self.inputs.store.health().await {
+                        Ok(health) => health.is_failed(),
+                        Err(e) => {
+                            warn!(self.logger, "Failed to read subgraph health";
+                                "error" => format!("{:#}", e));
+                            false
+                        }
+                    };
+                    if !already_failed
+                        && let Err(e) = self.fail_subgraph(message, Some(block_ptr), false).await
+                    {
+                        warn!(self.logger, "Failed to record non-deterministic error";
+                            "error" => format!("{:#}", e));
                     }
 
                     // Sleep before restarting.
