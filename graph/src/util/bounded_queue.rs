@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, sync::Mutex};
 
-use crate::prelude::tokio::sync::Semaphore;
+use crate::prelude::tokio::sync::{Semaphore, TryAcquireError};
 
 /// An async-friendly queue of bounded size. In contrast to a bounded channel,
 /// the queue makes it possible to modify and remove entries in it.
@@ -167,8 +167,156 @@ impl<T: Clone> BoundedQueue<T> {
         queue.iter().rev().fold(init, f)
     }
 
-    /// Clear the queue by popping entries until there are none left
+    /// Remove the entries that are poppable when `clear` starts. Entries
+    /// that a concurrent `push` inserts while `clear` runs stay in the
+    /// queue, and so does an entry whose pop permit has not been added yet
     pub fn clear(&self) {
-        while self.try_pop().is_some() {}
+        let count = self.acquire_all_pop_permits();
+        if count == 0 {
+            return;
+        }
+        let drained: Vec<T> = self.queue.lock().unwrap().drain(..count).collect();
+        self.push_semaphore.add_permits(count);
+        drop(drained);
+    }
+
+    fn acquire_all_pop_permits(&self) -> usize {
+        loop {
+            let count = self.pop_semaphore.available_permits();
+            if count == 0 {
+                return 0;
+            }
+            match self.pop_semaphore.try_acquire_many(count as u32) {
+                Ok(permit) => {
+                    permit.forget();
+                    return count;
+                }
+                Err(TryAcquireError::NoPermits) => continue,
+                Err(TryAcquireError::Closed) => unreachable!("we never close the pop_semaphore"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    use futures03::FutureExt;
+    use futures03::task::noop_waker_ref;
+
+    use super::BoundedQueue;
+
+    type PendingPush = Rc<RefCell<Option<Pin<Box<dyn Future<Output = ()>>>>>>;
+
+    #[derive(Clone)]
+    struct Item {
+        id: u32,
+        on_drop: Option<PendingPush>,
+    }
+
+    impl Item {
+        fn new(id: u32) -> Self {
+            Item { id, on_drop: None }
+        }
+    }
+
+    impl std::fmt::Debug for Item {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Item({})", self.id)
+        }
+    }
+
+    impl PartialEq for Item {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Drop for Item {
+        fn drop(&mut self) {
+            if let Some(pending) = self.on_drop.take() {
+                poll_once(&pending);
+            }
+        }
+    }
+
+    fn poll_once(pending: &PendingPush) {
+        let mut slot = pending.borrow_mut();
+        if let Some(fut) = slot.as_mut() {
+            let mut cx = Context::from_waker(noop_waker_ref());
+            if let Poll::Ready(()) = fut.as_mut().poll(&mut cx) {
+                *slot = None;
+            }
+        }
+    }
+
+    #[test]
+    fn clear_keeps_item_pushed_during_clear() {
+        let queue = Rc::new(BoundedQueue::with_capacity(1));
+        let pending: PendingPush = Rc::new(RefCell::new(None));
+
+        let pushing = queue.clone();
+        *pending.borrow_mut() = Some(Box::pin(async move { pushing.push(Item::new(2)).await }));
+
+        let a = Item {
+            id: 1,
+            on_drop: Some(pending.clone()),
+        };
+        queue.push(a).now_or_never().expect("queue has room for A");
+
+        poll_once(&pending);
+        assert!(pending.borrow().is_some(), "push(B) blocks on a full queue");
+
+        queue.clear();
+
+        assert!(
+            pending.borrow().is_none(),
+            "push(B) completed while A was dropped inside clear"
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.try_pop(), Some(Item::new(2)));
+    }
+
+    #[test]
+    fn clear_restores_permits() {
+        for capacity in 1..=4usize {
+            for prefill in 0..=capacity {
+                let queue = BoundedQueue::with_capacity(capacity);
+                for i in 0..prefill {
+                    queue
+                        .push(i)
+                        .now_or_never()
+                        .expect("prefill fits in the queue");
+                }
+
+                queue.clear();
+
+                assert_eq!(queue.try_pop(), None, "cap {capacity} prefill {prefill}");
+                assert_eq!(queue.len(), 0, "cap {capacity} prefill {prefill}");
+                for i in 0..capacity {
+                    assert!(
+                        queue.push(i).now_or_never().is_some(),
+                        "cap {capacity} prefill {prefill}: push {i} blocked"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clear_skips_item_without_pop_permit() {
+        let queue = BoundedQueue::with_capacity(2);
+        queue.push(1).now_or_never().expect("queue has room");
+        queue.queue.lock().unwrap().push_back(2);
+
+        queue.clear();
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.queue.lock().unwrap().front(), Some(&2));
     }
 }
