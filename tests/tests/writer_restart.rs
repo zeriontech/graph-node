@@ -36,16 +36,21 @@ fn db() -> PgConnection {
     PgConnection::establish(&url).expect("connect to the test database")
 }
 
+fn deployment_namespace(ctx: &TestContext) -> String {
+    let id = ctx.deployment.id;
+    diesel::select(sql::<Text>(&format!(
+        "(select name from deployment_schemas where id = {id})"
+    )))
+    .get_result(&mut db())
+    .unwrap()
+}
+
 /// Fails the first transaction that moves the deployment head to `block` or
 /// later; the sequence is not rolled back with it, so later writes succeed.
 /// Returns the deployment's namespace.
 fn fail_first_write_reaching(ctx: &TestContext, block: BlockNumber) -> String {
     let id = ctx.deployment.id;
-    let nsp: String = diesel::select(sql::<Text>(&format!(
-        "(select name from deployment_schemas where id = {id})"
-    )))
-    .get_result(&mut db())
-    .unwrap();
+    let nsp = deployment_namespace(ctx);
     db().batch_execute(&format!(
         "
         create sequence {nsp}.failed_writes;
@@ -223,23 +228,6 @@ impl Outage {
         .unwrap()
     }
 
-    /// Waits until statements failed `reads` times during the outage, while
-    /// the runner is still running.
-    async fn wait_for_failed_reads(&self, reads: i64, run: &mut RunningRunner) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while self.failed_reads() < reads {
-            tokio::select! {
-                result = &mut *run => panic!("the runner ended during the outage: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "statements failed {} times, waited for {reads}",
-                self.failed_reads()
-            );
-        }
-    }
-
     fn end(&mut self) {
         if !self.ended {
             let table = self.table;
@@ -259,6 +247,93 @@ impl Drop for Outage {
     fn drop(&mut self) {
         self.end();
     }
+}
+
+/// Waits until the injected failures happened `failures` times, while the
+/// runner is still running.
+async fn wait_for_failures(count: impl Fn() -> i64, failures: i64, run: &mut RunningRunner) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while count() < failures {
+        tokio::select! {
+            result = &mut *run => panic!("the runner ended during the outage: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "failed {} times, waited for {failures}",
+            count()
+        );
+    }
+}
+
+/// Fails every attempt to record a fatal error until `end`; the block writes
+/// that carry the error succeed.
+struct ErrorRecordingOutage {
+    nsp: String,
+    ended: bool,
+}
+
+impl ErrorRecordingOutage {
+    fn start(ctx: &TestContext) -> Self {
+        let id = ctx.deployment.id;
+        let nsp = deployment_namespace(ctx);
+        db().batch_execute(&format!(
+            "
+            create sequence {nsp}.failed_records;
+
+            create function {nsp}.fail_error_record() returns trigger
+            language plpgsql as $$
+            begin
+                perform nextval('{nsp}.failed_records');
+                raise exception 'injected outage: database unavailable';
+            end;
+            $$;
+
+            create trigger fail_error_record_{nsp}
+                before update on subgraphs.deployment
+                for each row
+                when (new.id = {id} and new.fatal_error is not null)
+                execute function {nsp}.fail_error_record();
+            "
+        ))
+        .unwrap();
+        ErrorRecordingOutage { nsp, ended: false }
+    }
+
+    fn failed_records(&self) -> i64 {
+        let nsp = &self.nsp;
+        diesel::select(sql::<BigInt>(&format!(
+            "(select case when is_called then last_value else 0 end from {nsp}.failed_records)"
+        )))
+        .get_result(&mut db())
+        .unwrap()
+    }
+
+    fn end(&mut self) {
+        if !self.ended {
+            let nsp = &self.nsp;
+            db().batch_execute(&format!(
+                "drop trigger fail_error_record_{nsp} on subgraphs.deployment;"
+            ))
+            .unwrap();
+            self.ended = true;
+        }
+    }
+}
+
+impl Drop for ErrorRecordingOutage {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+fn head_number(ctx: &TestContext) -> BlockNumber {
+    let id = ctx.deployment.id;
+    diesel::select(sql::<Integer>(&format!(
+        "(select block_number from subgraphs.head where id = {id})"
+    )))
+    .get_result(&mut db())
+    .unwrap()
 }
 
 type RunningRunner = Pin<Box<dyn Future<Output = Result<(), anyhow::Error>>>>;
@@ -302,7 +377,7 @@ async fn store_errors_while_handling_a_non_deterministic_error_keep_the_runner()
 
     let mut run = start_runner(ctx.runner(stop_block.clone()).await);
     // `health()` and `fail_subgraph()` in the non-deterministic error arm.
-    outage.wait_for_failed_reads(2, &mut run).await;
+    wait_for_failures(|| outage.failed_reads(), 2, &mut run).await;
     outage.end();
 
     tokio::time::timeout(Duration::from_secs(60), run)
@@ -330,7 +405,7 @@ async fn store_errors_at_restart_back_off_and_retry() {
 
     let mut run = start_runner(ctx.runner(stop_block.clone()).await);
     // Two `store.restart()` calls, so the first one was retried.
-    outage.wait_for_failed_reads(2, &mut run).await;
+    wait_for_failures(|| outage.failed_reads(), 2, &mut run).await;
     assert_eq!(outage.head_behind_outage(&ctx), 1);
     outage.end();
 
@@ -360,7 +435,7 @@ async fn unassigned_runner_stops_while_restart_backs_off() {
     let runner = ctx.runner(stop_block).await;
     let instances = runner.context().instances.clone();
     let mut run = start_runner(runner);
-    outage.wait_for_failed_reads(2, &mut run).await;
+    wait_for_failures(|| outage.failed_reads(), 2, &mut run).await;
 
     instances.remove(&ctx.deployment.id);
 
@@ -371,4 +446,42 @@ async fn unassigned_runner_stops_while_restart_backs_off() {
     if let Err(e) = result {
         assert!(!format!("{e:#}").contains("injected outage"), "{e:#}");
     }
+}
+
+#[graph::test]
+async fn deterministic_error_is_recorded_without_passing_its_block() {
+    let _one_test = ONE_TEST_AT_A_TIME.lock().await;
+    configure_writer_for_injected_failures();
+
+    let RunnerTestRecipe { stores, test_info } =
+        RunnerTestRecipe::new("deterministic_error_recorded_in_place", "fatal-error").await;
+
+    let mut blocks = vec![genesis()];
+    for number in 1..=5 {
+        blocks.push(empty_block(blocks.last().unwrap().ptr(), test_ptr(number)));
+    }
+
+    let chain = chain(&test_info.test_name, blocks, &stores, None).await;
+    let mut env_vars = EnvVars::default();
+    env_vars.subgraph_error_retry_ceil = Duration::from_secs(1);
+    let ctx = fixture::setup(&test_info, &stores, &chain, None, Some(env_vars)).await;
+
+    let mut outage = ErrorRecordingOutage::start(&ctx);
+
+    let mut run = start_runner(ctx.runner(test_ptr(5)).await);
+    // The fatal-error subgraph fails deterministically at block 3.
+    wait_for_failures(|| outage.failed_records(), 2, &mut run).await;
+    assert!(head_number(&ctx) <= 3);
+    outage.end();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("the runner did not finish after the outage");
+    assert!(result.is_err());
+
+    assert!(head_number(&ctx) <= 3);
+    let status = ctx.indexing_status().await;
+    let err = status.fatal_error.unwrap();
+    assert_eq!(err.block.number, 3.into());
+    assert!(err.deterministic);
 }

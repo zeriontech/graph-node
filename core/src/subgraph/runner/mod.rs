@@ -1430,12 +1430,18 @@ where
                     let message = format!("{:#}", e).replace('\n', "\t");
                     let err = anyhow!("{}, code: {}", message, LogCode::SubgraphSyncingFailure);
 
-                    if let Err(e) = self.fail_subgraph(message, Some(block_ptr), true).await {
+                    // The block's PoI is already written, so a restart would resume past it.
+                    while let Err(e) = self
+                        .fail_subgraph(message.clone(), Some(block_ptr.clone()), true)
+                        .await
+                    {
+                        if self.is_canceled() {
+                            return Ok(Action::Stop);
+                        }
                         error!(self.logger, "Failed to record deterministic error, retrying: {:#}", e;
                             "attempt" => self.state.backoff.attempt,
                             "retry_delay_s" => self.state.backoff.delay().as_secs());
                         self.state.backoff.sleep_async().await;
-                        return Ok(Action::Restart);
                     }
 
                     Err(err)
