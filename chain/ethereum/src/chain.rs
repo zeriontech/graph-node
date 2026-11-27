@@ -69,6 +69,20 @@ use graph::blockchain::block_stream::{
 /// Celo Mainnet: 42220, Testnet Alfajores: 44787, Testnet Baklava: 62320
 const CELO_CHAIN_IDS: [u64; 3] = [42220, 44787, 62320];
 
+/// Celo gets a reorg threshold of 0 while `celo_force_getlogs` is set, so its polling block
+/// stream scans every block with `eth_getLogs`; every other chain keeps `reorg_threshold`.
+fn polling_reorg_threshold(
+    chain_id: u64,
+    celo_force_getlogs: bool,
+    reorg_threshold: BlockNumber,
+) -> BlockNumber {
+    if celo_force_getlogs && CELO_CHAIN_IDS.contains(&chain_id) {
+        0
+    } else {
+        reorg_threshold
+    }
+}
+
 /// Resolved per-chain settings. Populated at chain initialisation from the config file (with
 /// ENV_VAR fallbacks) and stored on [`Chain`] and [`crate::EthereumAdapter`].
 #[derive(Clone, Debug)]
@@ -205,8 +219,11 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
             .subscribe(chain.name.to_string(), logger.clone());
 
         // Special case: Detect Celo and set the threshold to 0, so that eth_getLogs is always used.
-        // This is ok because Celo blocks are always final. And we _need_ to do this because
-        // some events appear only in eth_getLogs but not in transaction receipts.
+        // This assumes Celo blocks are always final and that some events appear only in
+        // eth_getLogs but not in transaction receipts, both true of the pre-2025 Celo L1.
+        // Celo is now an OP-stack L2 whose blocks are not final at the head, so
+        // GRAPH_ETHEREUM_CELO_FORCE_GETLOGS=false gives it the normal reorg threshold once
+        // eth_getLogs and block receipt logs are verified to agree.
         // See also ca0edc58-0ec5-4c89-a7dd-2241797f5e50.
         let reorg_threshold = match chain.chain_client().as_ref() {
             ChainClient::Rpc(adapter) => {
@@ -217,11 +234,11 @@ impl BlockStreamBuilder<Chain> for EthereumStreamBuilder {
                     .chain_id()
                     .await?;
 
-                if CELO_CHAIN_IDS.contains(&chain_id) {
-                    0
-                } else {
-                    chain.reorg_threshold
-                }
+                polling_reorg_threshold(
+                    chain_id,
+                    ENV_VARS.celo_force_getlogs,
+                    chain.reorg_threshold,
+                )
             }
             _ if is_using_subgraph_composition => chain.reorg_threshold,
             _ => panic!(
@@ -1448,6 +1465,22 @@ mod tests {
             parent_hash: BlockHash(vec![0; 32].into_boxed_slice()),
             timestamp: BlockTime::for_test(&ptr),
         }
+    }
+
+    #[test]
+    fn polling_reorg_threshold_forces_zero_for_celo_when_flag_on() {
+        for celo in [42220, 44787, 62320] {
+            assert_eq!(polling_reorg_threshold(celo, true, 250), 0);
+        }
+        assert_eq!(polling_reorg_threshold(1, true, 250), 250);
+    }
+
+    #[test]
+    fn polling_reorg_threshold_uses_chain_threshold_for_celo_when_flag_off() {
+        for celo in [42220, 44787, 62320] {
+            assert_eq!(polling_reorg_threshold(celo, false, 250), 250);
+        }
+        assert_eq!(polling_reorg_threshold(1, false, 250), 250);
     }
 
     #[graph::test]

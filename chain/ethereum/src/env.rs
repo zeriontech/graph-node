@@ -95,6 +95,11 @@ pub struct EnvVars {
     /// When enabled, forces the use of RPC instead of Firehose for loading block pointers by numbers.
     /// This is used in composable subgraphs. Firehose can be slow for loading block pointers by numbers.
     pub force_rpc_for_block_ptrs: bool,
+    /// Set by the flag `GRAPH_ETHEREUM_CELO_FORCE_GETLOGS`. On by default.
+    /// When enabled, polling block streams on Celo chains use a reorg threshold
+    /// of 0, so every block is scanned with `eth_getLogs` instead of using
+    /// receipts of ingested blocks.
+    pub celo_force_getlogs: bool,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -146,6 +151,7 @@ impl From<Inner> for EnvVars {
                 .map(str::to_string)
                 .collect(),
             force_rpc_for_block_ptrs: x.force_rpc_for_block_ptrs.0,
+            celo_force_getlogs: x.celo_force_getlogs.0,
         }
     }
 }
@@ -199,4 +205,37 @@ struct Inner {
     eth_call_no_gas: String,
     #[envconfig(from = "GRAPH_ETHEREUM_FORCE_RPC_FOR_BLOCK_PTRS", default = "true")]
     force_rpc_for_block_ptrs: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_ETHEREUM_CELO_FORCE_GETLOGS", default = "true")]
+    celo_force_getlogs: EnvVarBoolean,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn celo_force_getlogs(env: &[(&str, &str)]) -> bool {
+        let env: HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        EnvVars::from(Inner::init_from_hashmap(&env).unwrap()).celo_force_getlogs
+    }
+
+    #[test]
+    fn celo_force_getlogs_defaults_to_true() {
+        assert!(celo_force_getlogs(&[]));
+    }
+
+    #[test]
+    fn celo_force_getlogs_can_be_turned_off() {
+        assert!(!celo_force_getlogs(&[(
+            "GRAPH_ETHEREUM_CELO_FORCE_GETLOGS",
+            "false"
+        )]));
+        assert!(celo_force_getlogs(&[(
+            "GRAPH_ETHEREUM_CELO_FORCE_GETLOGS",
+            "true"
+        )]));
+    }
 }
