@@ -58,6 +58,14 @@ those.
   be used if the store uses more than one shard.
 - `GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER`: Specify genesis block number. If the flag
   is not set, the default value will be `0`.
+- `GRAPH_ETHEREUM_CELO_FORCE_GETLOGS`: When `true` (the default), subgraphs on
+  Celo (chain ids 42220, 44787, 62320) use a reorg threshold of 0, so their
+  block stream calls `eth_getLogs` for every block instead of reading logs from
+  the receipts of ingested blocks. Set to `false` to give Celo the chain's
+  normal reorg threshold, like every other chain. The special case dates from
+  the Celo L1, where blocks were final at once and some events appeared only in
+  `eth_getLogs`; turn it off only after checking that `eth_getLogs` and block
+  receipt logs agree on the current chain. Other chains are not affected.
 - `GRAPH_ETH_GET_LOGS_MAX_CONTRACTS`: Maximum number of contracts to query in a single `eth_getLogs` request.
   Defaults to 2000.
 
